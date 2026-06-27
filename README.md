@@ -8,6 +8,24 @@ implemented as a NIF. A mutable buffer is allocated and written into
 by copying an Erlang binary into it, and its data is passed directly
 to the OpenGL functions that operate on pixel data.
 
+## Usage
+
+```
+$ rebar3 shell
+===> Verifying dependencies...
+===> Analyzing applications...
+===> Compiling mut_bin
+===> Compiling test_wx
+
+Eshell V17.0.2 (press Ctrl+G to abort, type help(). for help)
+1> test_wx_win:start().
+```
+
+Currently on my machine, several libEGL warnings and one MESA error
+are displayed, but everything seems to work fine.
+
+Press, 1, 2, or 3 to toggle between fullscreen and windowed modes.
+
 # AI
 
 The `test_wx_win` demonstration includes AI-generated code and
