@@ -5,10 +5,11 @@
     {mod, {test_wx_app, []}},
     {applications, [
         kernel,
-        stdlib
+        stdlib,
+        mut_bin
     ]},
     {env, []},
     {modules, []},
-    {licenses, ["Apache-2.0"]},
+    {licenses, ["GPL-3.0"]},
     {links, []}
  ]}.
