@@ -12,7 +12,7 @@
 
 -record(state, {sb, frame, canvas, context,
                 tex,        %% GL texture id we blit the backing buffer into
-                buf,        %% the backing buffer (RGBA bytes), in-process for now
+                buf,        %% the backing buffer (RGBA bytes), using mut_bin library
                 tw, th,     %% backing buffer width/height in pixels
                 mode}).     %% windowing mode: windowed | windowed_fullscreen | fullscreen
 
@@ -83,11 +83,12 @@ init(Mode) ->
     wxGLCanvas:setCurrent(Canvas, Context),
     gl:clearColor(0.0, 0.0, 0.0, 1.0),
 
-    %% Build an in-process backing buffer and allocate a texture from it.
-    %% Later, `Buf` becomes something mutable that another process writes.
+    %% Build a mutable backing buffer and allocate a texture from it.
     W = 256, H = 256,
     Buf = make_buffer(W, H),
-    Tex = init_texture(W, H, Buf),
+    %% Get pointer to pixels from mutable binary
+    {Pixels, _} = mut_bin:data(Buf),
+    Tex = init_texture(W, H, Pixels),
 
     %% Kick off the render loop, then apply the windowing mode. Both are
     %% queued as messages and render is enqueued first, so by the time
@@ -148,13 +149,19 @@ init_texture(W, H, Pixels) ->
 %% A throwaway gradient so there's something on screen. Row-major,
 %% top row first, 4 bytes (R,G,B,A) per pixel.
 make_buffer(W, H) ->
-    << << (X rem 256), (Y rem 256), 128, 255 >>
-       || Y <- lists:seq(0, H - 1), X <- lists:seq(0, W - 1) >>.
+    Size = 4 * W * H,
+    {ok, MBin} = mut_bin:alloc(Size),
+
+    %% Temporary immutable binary is used to initialize the mutable
+    Bin = << << (X rem 256), (Y rem 256), 128, 255 >>
+             || Y <- lists:seq(0, H - 1), X <- lists:seq(0, W - 1) >>,
+    ok = mut_bin:copy(MBin, 0, Bin, 0, Size),
+    MBin.
 
 %% The render function. Everything between setCurrent and swapBuffers is
 %% drawn into the back buffer; swapBuffers flips it onto the screen.
 render(#state{canvas=Canvas, context=Context, tex=Tex,
-              buf=Pixels, tw=W, th=H}) ->
+              buf=MBuf, tw=W, th=H}) ->
     wxGLCanvas:setCurrent(Canvas, Context),
 
     %% Upload the current backing buffer into the texture. texSubImage2D
@@ -162,6 +169,9 @@ render(#state{canvas=Canvas, context=Context, tex=Tex,
     %% Right now Pixels never changes, but this is the path a mutable
     %% buffer will use.
     gl:bindTexture(?GL_TEXTURE_2D, Tex),
+
+    %% Get pointer to pixels from mutable binary
+    {Pixels, _} = mut_bin:data(MBuf),
     gl:texSubImage2D(?GL_TEXTURE_2D, 0, 0, 0, W, H,
                      ?GL_RGBA, ?GL_UNSIGNED_BYTE, Pixels),
 
@@ -213,8 +223,20 @@ handle_event(#wx{event=#wxSize{size={W,H}}},
     %% uploads at the new size.
     Buf = make_buffer(W, H),
     gl:bindTexture(?GL_TEXTURE_2D, Tex),
+
+    %% Get pointer to pixels from mutable binary
+    {Pixels, _} = mut_bin:data(Buf),
     gl:texImage2D(?GL_TEXTURE_2D, 0, ?GL_RGBA, W, H, 0,
-                  ?GL_RGBA, ?GL_UNSIGNED_BYTE, Buf),
+                  ?GL_RGBA, ?GL_UNSIGNED_BYTE, Pixels),
+
+    %% Deallocate the previous mutable binary
+    case State#state.buf of
+        undefined ->
+            ok;
+        MB ->
+            mut_bin:dealloc(MB)
+    end,
+
     {noreply,State#state{buf=Buf,tw=W,th=H}};
 handle_event(#wx{event=#wxSize{}}, State) ->
     %% Degenerate size (e.g. minimized to 0xN); nothing to do.
