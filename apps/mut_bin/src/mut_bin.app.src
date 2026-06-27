@@ -1,0 +1,13 @@
+{application, mut_bin, [
+    {description, "A NIF library providing mutable binaries"},
+    {vsn, "0.0.1"},
+    {registered, []},
+    {applications, [
+        kernel,
+        stdlib
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["GPL-3.0"]},
+    {links, []}
+ ]}.
