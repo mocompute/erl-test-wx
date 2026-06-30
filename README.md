@@ -26,6 +26,12 @@ are displayed, but everything seems to work fine.
 
 Press, 1, 2, or 3 to toggle between fullscreen and windowed modes.
 
+## FPS
+
+Added a frames-per-second display and reduced the render timeout to
+1ms to see how fast the runtime can process simple frames. I observed
+150fps in a fullscreen display.
+
 # AI
 
 The `test_wx_win` demonstration includes AI-generated code and

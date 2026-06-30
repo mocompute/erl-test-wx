@@ -8,13 +8,27 @@
         init/1, terminate/2, code_change/3,
         handle_info/2, handle_call/3, handle_event/2]).
 
--define(FRAME_MS, 16).   %% ~60 fps (1000/60 = 16.67)
+-define(FRAME_MS, 1).         %% to observe max practical speed of timeout-based render loop
+-define(FPS_WINDOW_MS, 500).  %% how often the displayed fps is recomputed
+
+%% On-screen FPS overlay (HUD). Drawn as an opaque box straight into the RGBA
+%% backing buffer, using a tiny 3x5 bitmap font (see glyph/1).
+-define(HUD_X, 4).        %% top-left margin in backing-buffer pixels
+-define(HUD_Y, 4).
+-define(HUD_SCALE, 3).    %% each font pixel becomes a SCALE x SCALE block
+-define(GLYPH_W, 3).
+-define(GLYPH_H, 5).
+-define(HUD_FG, <<0, 255, 0, 255>>).   %% glyph colour (opaque green)
+-define(HUD_BG, <<0, 0, 0, 255>>).     %% box background (opaque black)
 
 -record(state, {sb, frame, canvas, context,
                 tex,        %% GL texture id we blit the backing buffer into
                 buf,        %% the backing buffer (RGBA bytes), using mut_bin library
                 tw, th,     %% backing buffer width/height in pixels
-                mode}).     %% windowing mode: windowed | windowed_fullscreen | fullscreen
+                mode,       %% windowing mode: windowed | windowed_fullscreen | fullscreen
+                last_t,     %% monotonic ms at the start of the current fps window
+                frames=0,   %% frames drawn since last_t
+                fps=0}).    %% last computed fps, shown in the HUD
 
 %% Windowing mode :: windowed | windowed_fullscreen | fullscreen
 start() ->
@@ -97,7 +111,8 @@ init(Mode) ->
     self() ! render,
     self() ! {apply_mode, Mode},
     {Frame,#state{frame=Frame, canvas=Canvas, context=Context,
-                  tex=Tex, buf=Buf, tw=W, th=H, mode=Mode}}.
+                  tex=Tex, buf=Buf, tw=W, th=H, mode=Mode,
+                  last_t=erlang:monotonic_time(millisecond)}}.
 
 %% Frame style flags per windowing mode. NOTE: init currently always creates
 %% with frame_style(windowed), because on Wayland a ?wxNO_BORDER top-level
@@ -161,14 +176,17 @@ make_buffer(W, H) ->
 %% The render function. Everything between setCurrent and swapBuffers is
 %% drawn into the back buffer; swapBuffers flips it onto the screen.
 render(#state{canvas=Canvas, context=Context, tex=Tex,
-              buf=MBuf, tw=W, th=H}) ->
+              buf=MBuf, tw=W, th=H, fps=Fps}) ->
     wxGLCanvas:setCurrent(Canvas, Context),
 
     %% Upload the current backing buffer into the texture. texSubImage2D
     %% reuses the existing allocation (cheaper than texImage2D each frame).
-    %% Right now Pixels never changes, but this is the path a mutable
-    %% buffer will use.
     gl:bindTexture(?GL_TEXTURE_2D, Tex),
+
+    %% Stamp the FPS overlay straight into the backing buffer so it rides
+    %% along with this frame's upload. This mutates the same memory Pixels
+    %% points at, so it must happen before texSubImage2D reads it.
+    draw_hud(MBuf, W, H, Fps),
 
     %% Get pointer to pixels from mutable binary
     {Pixels, _} = mut_bin:data(MBuf),
@@ -190,10 +208,90 @@ render(#state{canvas=Canvas, context=Context, tex=Tex,
 
     wxGLCanvas:swapBuffers(Canvas).
 
-handle_info(render, State) ->
+%% Frame-rate measurement. Counts frames within a ~?FPS_WINDOW_MS window of
+%% monotonic time (so the reading is unaffected by wall-clock adjustments) and
+%% recomputes the displayed fps once per window.
+tick_fps(State=#state{last_t=Last, frames=Frames0}) ->
+    Frames = Frames0 + 1,
+    Now = erlang:monotonic_time(millisecond),
+    Dt = Now - Last,
+    case Dt >= ?FPS_WINDOW_MS of
+        true  -> State#state{fps=round(Frames * 1000 / Dt), frames=0, last_t=Now};
+        false -> State#state{frames=Frames}
+    end.
+
+%% --- On-screen FPS overlay -------------------------------------------------
+%% Rasterise "<n> fps" straight into the RGBA backing buffer as an opaque box
+%% (so it overwrites whatever was there last frame -- no need to restore the
+%% pixels underneath). Only mut_bin:copy/5 mutates the buffer, so the mut_bin
+%% NIF itself stays untouched.
+
+fps_text(Fps) ->
+    integer_to_list(Fps) ++ " fps".
+
+draw_hud(MBuf, W, H, Fps) ->
+    Text = fps_text(Fps),
+    %% Each char is GLYPH_W px wide plus a 1px inter-glyph gap, scaled up.
+    BoxW = length(Text) * (?GLYPH_W + 1) * ?HUD_SCALE,
+    BoxH = ?GLYPH_H * ?HUD_SCALE,
+    case (?HUD_X + BoxW =< W) andalso (?HUD_Y + BoxH =< H) of
+        false ->
+            %% Window too small for the overlay; skip to stay in bounds.
+            ok;
+        true ->
+            lists:foreach(
+              fun(Sy) ->
+                      RowBin = hud_row(Text, Sy div ?HUD_SCALE),
+                      Offset = ((?HUD_Y + Sy) * W + ?HUD_X) * 4,
+                      ok = mut_bin:copy(MBuf, Offset, RowBin, 0, byte_size(RowBin))
+              end,
+              lists:seq(0, BoxH - 1))
+    end.
+
+%% One screen row (BoxW pixels of RGBA) for font row Fr across all chars.
+hud_row(Text, Fr) ->
+    list_to_binary([ glyph_row(C, Fr) || C <- Text ]).
+
+%% Pixels for a single char on font row Fr: GLYPH_W cells (msb = leftmost) plus
+%% one trailing gap cell, each scaled horizontally by HUD_SCALE.
+glyph_row(C, Fr) ->
+    Bits = lists:nth(Fr + 1, glyph(C)),
+    Cells = [ bit_pixel(Bits, Col) || Col <- lists:seq(?GLYPH_W - 1, 0, -1) ],
+    list_to_binary(Cells ++ [dup(?HUD_BG, ?HUD_SCALE)]).
+
+bit_pixel(Bits, Col) ->
+    case (Bits bsr Col) band 1 of
+        1 -> dup(?HUD_FG, ?HUD_SCALE);
+        0 -> dup(?HUD_BG, ?HUD_SCALE)
+    end.
+
+%% Repeat a 4-byte pixel binary N times.
+dup(Pixel, N) ->
+    list_to_binary(lists:duplicate(N, Pixel)).
+
+%% 3x5 bitmap font: each glyph is 5 rows of 3 bits (msb = leftmost pixel).
+%% Only the characters needed for "<n> fps" are defined; anything else (incl.
+%% space) renders blank.
+glyph($0) -> [2#111,2#101,2#101,2#101,2#111];
+glyph($1) -> [2#010,2#110,2#010,2#010,2#111];
+glyph($2) -> [2#111,2#001,2#111,2#100,2#111];
+glyph($3) -> [2#111,2#001,2#111,2#001,2#111];
+glyph($4) -> [2#101,2#101,2#111,2#001,2#001];
+glyph($5) -> [2#111,2#100,2#111,2#001,2#111];
+glyph($6) -> [2#111,2#100,2#111,2#101,2#111];
+glyph($7) -> [2#111,2#001,2#010,2#100,2#100];
+glyph($8) -> [2#111,2#101,2#111,2#101,2#111];
+glyph($9) -> [2#111,2#101,2#111,2#001,2#111];
+glyph($f) -> [2#011,2#100,2#110,2#100,2#100];
+glyph($p) -> [2#110,2#101,2#110,2#100,2#100];
+glyph($s) -> [2#011,2#100,2#010,2#001,2#110];
+glyph(_)  -> [2#000,2#000,2#000,2#000,2#000].
+
+handle_info(render, State0) ->
     %% Schedule the next frame first so the period is ~FRAME_MS regardless
     %% of how long this frame's render takes.
     erlang:send_after(?FRAME_MS, self(), render),
+    State = tick_fps(State0),
     render(State),
     {noreply,State};
 handle_info({apply_mode, Mode}, State=#state{frame=Frame}) ->
